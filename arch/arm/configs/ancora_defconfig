@@ -48,7 +48,7 @@ CONFIG_HAVE_KERNEL_LZMA=y
 CONFIG_HAVE_KERNEL_XZ=y
 CONFIG_HAVE_KERNEL_LZO=y
 # CONFIG_KERNEL_GZIP is not set
-# CONFIG_KERNEL_LZMA is not set
+CONFIG_KERNEL_LZMA=y
 CONFIG_KERNEL_XZ=y
 # CONFIG_KERNEL_LZO is not set
 CONFIG_DEFAULT_HOSTNAME="(none)"
@@ -639,6 +639,11 @@ CONFIG_ALIGNMENT_TRAP=y
 # CONFIG_USE_OF is not set
 CONFIG_ZBOOT_ROM_TEXT=0x0
 CONFIG_ZBOOT_ROM_BSS=0x0
+# Bring-up ONLY: forces SELinux permissive on every boot because
+# CMDLINE_EXTEND appends this to the Samsung bootloader cmdline. REMOVE this
+# variable (or set CONFIG_CMDLINE="") once the Oreo sepolicy boot is
+# denial-free in enforcing mode — setenforce 1 must persist via
+# CONFIG_SECURITY_SELINUX_DEVELOP until then.
 CONFIG_CMDLINE="androidboot.selinux=permissive"
 CONFIG_CMDLINE_FROM_BOOTLOADER=y
 CONFIG_CMDLINE_EXTEND=y
@@ -797,7 +802,11 @@ CONFIG_IPV6_MULTIPLE_TABLES=y
 CONFIG_IPV6_SUBTREES=y
 # CONFIG_IPV6_MROUTE is not set
 # CONFIG_NETLABEL is not set
-CONFIG_ANDROID_PARANOID_NETWORK=y
+# Android 8.0 no longer grants the inet (3003) supplementary gid to app
+# processes (AMS builds gids with shared/cache/user + perm gids only), so the
+# kernel-side paranoid network group check denies socket creation to every app.
+# Network access enforcement is SELinux-only on Oreo — keep this disabled.
+# CONFIG_ANDROID_PARANOID_NETWORK is not set
 CONFIG_NET_ACTIVITY_STATS=y
 CONFIG_NETWORK_SECMARK=y
 # CONFIG_NETWORK_PHY_TIMESTAMPING is not set

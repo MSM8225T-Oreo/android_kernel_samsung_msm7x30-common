@@ -84,6 +84,22 @@ struct binder_version {
 /* This is the current protocol version. */
 #define BINDER_CURRENT_PROTOCOL_VERSION 7
 
+/*
+ * Node introspection used by Android 8.0's libbinder
+ * (ProcessState::getKernelReferences); the layout must match the
+ * userspace struct in libs/binder/ProcessState.cpp:
+ *   binder_uintptr_t ptr;  ->  __u32 on 32-bit Android (BINDER_IPC_32BIT)
+ *   binder_uintptr_t cookie;
+ *   __u32 has_strong_ref;
+ *   __u32 has_weak_ref;
+ */
+struct binder_node_debug_info {
+	__u32			ptr;
+	__u32			cookie;
+	__u32			has_strong_ref;
+	__u32			has_weak_ref;
+};
+
 #define BINDER_WRITE_READ		_IOWR('b', 1, struct binder_write_read)
 #define	BINDER_SET_IDLE_TIMEOUT		_IOW('b', 3, int64_t)
 #define	BINDER_SET_MAX_THREADS		_IOW('b', 5, size_t)
@@ -91,6 +107,7 @@ struct binder_version {
 #define	BINDER_SET_CONTEXT_MGR		_IOW('b', 7, int)
 #define	BINDER_THREAD_EXIT		_IOW('b', 8, int)
 #define BINDER_VERSION			_IOWR('b', 9, struct binder_version)
+#define BINDER_GET_NODE_DEBUG_INFO	_IOWR('b', 11, struct binder_node_debug_info)
 
 /*
  * NOTE: Two special error codes you should check for when calling

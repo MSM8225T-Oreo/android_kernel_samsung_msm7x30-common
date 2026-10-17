@@ -49,8 +49,24 @@ static HLIST_HEAD(binder_dead_nodes);
 
 static struct dentry *binder_debugfs_dir_entry_root;
 static struct dentry *binder_debugfs_dir_entry_proc;
-static struct binder_node *binder_context_mgr_node;
-static uid_t binder_context_mgr_uid = -1;
+/*
+ * Oreo needs two independently-operating binder nodes: servicemanager
+ * owns the context of /dev/binder, hwservicemanager owns the context of
+ * /dev/hwbinder. Old binder.c only supported a single global context
+ * manager, so a second BINDER_SET_CONTEXT_MGR would have failed. Track
+ * one context manager per node (index 0 = /dev/binder, 1 = /dev/hwbinder).
+ */
+#define BINDER_MAX_NODES 2
+static struct binder_node *binder_context_mgr_nodes[BINDER_MAX_NODES];
+static uid_t binder_context_mgr_uids[BINDER_MAX_NODES] = { (uid_t)-1, (uid_t)-1 };
+
+/* Second node registration is completed in binder_init(); see the comment
+ * next to its struct binder_fops binding. */
+static struct miscdevice hwbinder_miscdev;
+/* True once /dev/hwbinder is successfully registered; guards the
+ * proc->binder_ctx classification in binder_open() against the case where
+ * the second misc_register() fails (minor would stay MISC_DYNAMIC_MINOR). */
+static int hwbinder_registered;
 static int binder_last_id;
 static struct workqueue_struct *binder_deferred_workqueue;
 
@@ -235,6 +251,7 @@ struct binder_node {
 	unsigned has_async_transaction:1;
 	unsigned accept_fds:1;
 	unsigned min_priority:8;
+	unsigned binder_ctx:1;
 	struct list_head async_todo;
 };
 
@@ -296,6 +313,8 @@ struct binder_proc {
 	struct files_struct *files;
 	struct hlist_node deferred_work_node;
 	int deferred_work;
+	/* which device node this proc was opened on (0=binder 1=hwbinder) */
+	unsigned binder_ctx;
 	void *buffer;
 	ptrdiff_t user_buffer_offset;
 
@@ -966,6 +985,18 @@ static struct binder_node *binder_get_node(struct binder_proc *proc,
 	return NULL;
 }
 
+static struct binder_node *binder_context_mgr_node_of(int ctx)
+{
+	return (ctx >= 0 && ctx < BINDER_MAX_NODES) ?
+		binder_context_mgr_nodes[ctx] : NULL;
+}
+
+static int binder_node_is_context_mgr(struct binder_node *node)
+{
+	return node != NULL && node->binder_ctx < BINDER_MAX_NODES &&
+	       binder_context_mgr_nodes[node->binder_ctx] == node;
+}
+
 static struct binder_node *binder_new_node(struct binder_proc *proc,
 					   void __user *ptr,
 					   void __user *cookie)
@@ -994,6 +1025,7 @@ static struct binder_node *binder_new_node(struct binder_proc *proc,
 	rb_insert_color(&node->rb_node, &proc->nodes);
 	node->debug_id = ++binder_last_id;
 	node->proc = proc;
+	node->binder_ctx = proc->binder_ctx;
 	node->ptr = ptr;
 	node->cookie = cookie;
 	node->work.type = BINDER_WORK_NODE;
@@ -1013,7 +1045,7 @@ static int binder_inc_node(struct binder_node *node, int strong, int internal,
 		if (internal) {
 			if (target_list == NULL &&
 			    node->internal_strong_refs == 0 &&
-			    !(node == binder_context_mgr_node &&
+			    !(binder_node_is_context_mgr(node) &&
 			    node->has_strong_ref)) {
 				printk(KERN_ERR "binder: invalid inc strong "
 					"node for %d\n", node->debug_id);
@@ -1133,7 +1165,7 @@ static struct binder_ref *binder_get_ref_for_node(struct binder_proc *proc,
 	rb_link_node(&new_ref->rb_node_node, parent, p);
 	rb_insert_color(&new_ref->rb_node_node, &proc->refs_by_node);
 
-	new_ref->desc = (node == binder_context_mgr_node) ? 0 : 1;
+	new_ref->desc = binder_node_is_context_mgr(node) ? 0 : 1;
 	for (n = rb_first(&proc->refs_by_desc); n != NULL; n = rb_next(n)) {
 		ref = rb_entry(n, struct binder_ref, rb_node_desc);
 		if (ref->desc > new_ref->desc)
@@ -1480,7 +1512,7 @@ static void binder_transaction(struct binder_proc *proc,
 			}
 			target_node = ref->node;
 		} else {
-			target_node = binder_context_mgr_node;
+			target_node = binder_context_mgr_node_of(proc->binder_ctx);
 			if (target_node == NULL) {
 				return_error = BR_DEAD_REPLY;
 				goto err_no_context_mgr_node;
@@ -1869,10 +1901,11 @@ int binder_thread_write(struct binder_proc *proc, struct binder_thread *thread,
 			if (get_user(target, (uint32_t __user *)ptr))
 				return -EFAULT;
 			ptr += sizeof(uint32_t);
-			if (target == 0 && binder_context_mgr_node &&
+			if (target == 0 &&
+			    binder_context_mgr_node_of(proc->binder_ctx) &&
 			    (cmd == BC_INCREFS || cmd == BC_ACQUIRE)) {
 				ref = binder_get_ref_for_node(proc,
-					       binder_context_mgr_node);
+					binder_context_mgr_node_of(proc->binder_ctx));
 				if (ref->desc != target) {
 					binder_user_error("binder: %d:"
 						"%d tried to acquire "
@@ -2721,6 +2754,37 @@ static unsigned int binder_poll(struct file *filp,
 	return 0;
 }
 
+/*
+ * Android 8.0 libbinder node introspection (ProcessState::getKernelReferences,
+ * used by binder stats/debug tooling). Returns the per-process node with the
+ * lowest user pointer strictly greater than info->ptr, or a zeroed struct
+ * when the walk is done. Called with binder_main_lock held, which covers
+ * proc->nodes (binder_new_node also runs under it).
+ */
+static int binder_ioctl_get_node_debug_info(struct binder_proc *proc,
+					    struct binder_node_debug_info *info)
+{
+	struct rb_node *n;
+	unsigned long ptr = (unsigned long)info->ptr;
+
+	memset(info, 0, sizeof(*info));
+
+	for (n = rb_first(&proc->nodes); n != NULL; n = rb_next(n)) {
+		struct binder_node *node = rb_entry(n, struct binder_node,
+						    rb_node);
+
+		if ((unsigned long)node->ptr > ptr) {
+			info->ptr = (u32)(unsigned long)node->ptr;
+			info->cookie = (u32)(unsigned long)node->cookie;
+			info->has_strong_ref = node->has_strong_ref;
+			info->has_weak_ref = node->has_weak_ref;
+			break;
+		}
+	}
+
+	return 0;
+}
+
 static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	int ret;
@@ -2798,34 +2862,38 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		}
 		break;
 	case BINDER_SET_CONTEXT_MGR:
-		if (binder_context_mgr_node != NULL) {
-			printk(KERN_ERR "binder: BINDER_SET_CONTEXT_MGR already set\n");
+		if (binder_context_mgr_nodes[proc->binder_ctx] != NULL) {
+			printk(KERN_ERR "binder: BINDER_SET_CONTEXT_MGR "
+				"already set on node %d\n", proc->binder_ctx);
 			ret = -EBUSY;
 			goto err;
 		}
 		ret = security_binder_set_context_mgr(proc->tsk);
 		if (ret < 0)
 			goto err;
-		if (binder_context_mgr_uid != -1) {
-			if (binder_context_mgr_uid != current->cred->euid) {
+		if (binder_context_mgr_uids[proc->binder_ctx] != (uid_t)-1) {
+			if (binder_context_mgr_uids[proc->binder_ctx] !=
+			    current->cred->euid) {
 				printk(KERN_ERR "binder: BINDER_SET_"
 				       "CONTEXT_MGR bad uid %d != %d\n",
 				       current->cred->euid,
-				       binder_context_mgr_uid);
+				       binder_context_mgr_uids[proc->binder_ctx]);
 				ret = -EPERM;
 				goto err;
 			}
 		} else
-			binder_context_mgr_uid = current->cred->euid;
-		binder_context_mgr_node = binder_new_node(proc, NULL, NULL);
-		if (binder_context_mgr_node == NULL) {
+			binder_context_mgr_uids[proc->binder_ctx] =
+				current->cred->euid;
+		binder_context_mgr_nodes[proc->binder_ctx] =
+			binder_new_node(proc, NULL, NULL);
+		if (binder_context_mgr_nodes[proc->binder_ctx] == NULL) {
 			ret = -ENOMEM;
 			goto err;
 		}
-		binder_context_mgr_node->local_weak_refs++;
-		binder_context_mgr_node->local_strong_refs++;
-		binder_context_mgr_node->has_strong_ref = 1;
-		binder_context_mgr_node->has_weak_ref = 1;
+		binder_context_mgr_nodes[proc->binder_ctx]->local_weak_refs++;
+		binder_context_mgr_nodes[proc->binder_ctx]->local_strong_refs++;
+		binder_context_mgr_nodes[proc->binder_ctx]->has_strong_ref = 1;
+		binder_context_mgr_nodes[proc->binder_ctx]->has_weak_ref = 1;
 		break;
 	case BINDER_THREAD_EXIT:
 		binder_debug(BINDER_DEBUG_THREADS, "binder: %d:%d exit\n",
@@ -2843,6 +2911,24 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			goto err;
 		}
 		break;
+	case BINDER_GET_NODE_DEBUG_INFO: {
+		struct binder_node_debug_info info;
+
+		if (size != sizeof(struct binder_node_debug_info)) {
+			ret = -EINVAL;
+			goto err;
+		}
+		if (copy_from_user(&info, ubuf, sizeof(info))) {
+			ret = -EFAULT;
+			goto err;
+		}
+		binder_ioctl_get_node_debug_info(proc, &info);
+		if (copy_to_user(ubuf, &info, sizeof(info))) {
+			ret = -EFAULT;
+			goto err;
+		}
+		break;
+	}
 	default:
 		ret = -EINVAL;
 		goto err;
@@ -3000,6 +3086,14 @@ static int binder_open(struct inode *nodp, struct file *filp)
 	proc = kzalloc(sizeof(*proc), GFP_KERNEL);
 	if (proc == NULL)
 		return -ENOMEM;
+	/* 0 = /dev/binder (binder_device), 1 = /dev/hwbinder (hwbinder_device);
+	 * binder_miscdev is registered before hwbinder_miscdev, so the only
+	 * way the minor can belong to the second node is hwbinder. Only
+	 * trusted after hwbinder_registered because a failed registration
+	 * leaves minor == MISC_DYNAMIC_MINOR. */
+	proc->binder_ctx =
+		(hwbinder_registered &&
+		 iminor(nodp) == hwbinder_miscdev.minor) ? 1 : 0;
 	get_task_struct(current);
 	proc->tsk = current;
 	INIT_LIST_HEAD(&proc->todo);
@@ -3074,11 +3168,17 @@ static void binder_deferred_release(struct binder_proc *proc)
 	BUG_ON(proc->files);
 
 	hlist_del(&proc->proc_node);
-	if (binder_context_mgr_node && binder_context_mgr_node->proc == proc) {
-		binder_debug(BINDER_DEBUG_DEAD_BINDER,
-			     "binder_release: %d context_mgr_node gone\n",
-			     proc->pid);
-		binder_context_mgr_node = NULL;
+	{
+		int i;
+		for (i = 0; i < BINDER_MAX_NODES; i++) {
+			if (binder_context_mgr_nodes[i] &&
+			    binder_context_mgr_nodes[i]->proc == proc) {
+				binder_debug(BINDER_DEBUG_DEAD_BINDER,
+					     "binder_release: %d context_mgr_node gone\n",
+					     proc->pid);
+				binder_context_mgr_nodes[i] = NULL;
+			}
+		}
 	}
 
 	threads = 0;
@@ -3702,6 +3802,24 @@ static int __init binder_init(void)
 		binder_debugfs_dir_entry_proc = debugfs_create_dir("proc",
 						 binder_debugfs_dir_entry_root);
 	ret = misc_register(&binder_miscdev);
+	/*
+	 * Android 8.0's libhwbinder hard-codes /dev/hwbinder, and its SELinux
+	 * policy requires two independently-labeled binder nodes:
+	 *   /dev/binder   -> binder_device   (servicemanager & all domains)
+	 *   /dev/hwbinder -> hwbinder_device (hwservicemanager & all domains;
+	 *     the platform policy has neverallow rules in both directions, so
+	 *     a single-labeled node cannot satisfy it.)
+	 * Register a second node driven by the same binder implementation.
+	 * Each open() still gets its own binder_proc; behavior is unchanged.
+	 */
+	hwbinder_miscdev.minor = MISC_DYNAMIC_MINOR;
+	hwbinder_miscdev.name = "hwbinder";
+	hwbinder_miscdev.fops = &binder_fops;
+	{
+		int ret2 = misc_register(&hwbinder_miscdev);
+		ret |= ret2;
+		hwbinder_registered = !ret2;
+	}
 	if (binder_debugfs_dir_entry_root) {
 		debugfs_create_file("state",
 				    S_IRUGO,
